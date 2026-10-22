@@ -5,8 +5,9 @@
  * playerbots addclass cache and PlayerbotHolder::AddPlayerBot. It does not
  * change mod-playerbots. The chosen talent row, gear band, and orders are
  * applied after that module has finished logging the bot in and rolling its
- * own talents. The last hire is stored in bot_recruiter_hire so the same
- * party can be brought back after a logout.
+ * own talents. A one-off hire is stored in bot_recruiter_hire for this
+ * session. Dungeon, Arena, and Battleground teams, and the PvE and PvP
+ * builds on those characters, are stored in their own tables.
  */
 
 #include "CharacterCache.h"
@@ -26,6 +27,7 @@
 #include "PlayerbotMgr.h"
 #include "Playerbots.h"
 #include "RandomPlayerbotMgr.h"
+#include "PlayerScript.h"
 #include "ScriptedGossip.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -219,6 +221,33 @@ ActivityChoice const kActivities[] = {
     {RecruitActivity::Battleground, "Battlegrounds", "bg battleground battlegrounds", false},
 };
 
+enum class SavedTeam : uint8
+{
+    Dungeon = 0,
+    Arena = 1,
+    Battleground = 2
+};
+
+enum class LoadoutKind : uint8
+{
+    Pve = 0,
+    Pvp = 1
+};
+
+struct TeamChoice
+{
+    SavedTeam team;
+    char const* label;
+    uint8 cap;
+    RecruitActivity activity;
+};
+
+TeamChoice const kTeams[] = {
+    {SavedTeam::Dungeon, "Dungeon", 5, RecruitActivity::Dungeon},
+    {SavedTeam::Arena, "Arena", 5, RecruitActivity::Arena},
+    {SavedTeam::Battleground, "Battleground", 10, RecruitActivity::Battleground},
+};
+
 struct MenuState
 {
     RecruitActivity activity = RecruitActivity::Dungeon;
@@ -228,6 +257,9 @@ struct MenuState
     GearBand gear = GearBand::Stored;
     bool summon = false;
     RecruitStance stance = RecruitStance::Damage;
+    SavedTeam team = SavedTeam::Dungeon;
+    bool assignTeam = false;
+    ObjectGuid setBot;
 };
 
 struct PendingRecruit
@@ -242,6 +274,11 @@ struct PendingRecruit
     uint32 appliedMs = 0;
     bool loginFinished = false;
     bool specApplied = false;
+    bool teamSummon = false;
+    bool assignTeam = false;
+    bool applySpec = true;
+    SavedTeam team = SavedTeam::Dungeon;
+    uint8 levelBefore = 0;
 };
 
 struct RecruitRequest
@@ -257,10 +294,28 @@ struct RecruitRequest
     ObjectGuid preferred;
     bool createNew = false;
     int specNo = -1;
+    bool assignTeam = false;
+    bool teamSummon = false;
+    bool applySpec = true;
+    SavedTeam team = SavedTeam::Dungeon;
+    uint8 levelBefore = 0;
+};
+
+struct ActiveCall
+{
+    ObjectGuid master;
+    SavedTeam team = SavedTeam::Dungeon;
 };
 
 std::unordered_map<ObjectGuid, MenuState> g_menu;
 std::unordered_map<ObjectGuid, PendingRecruit> g_pending;
+std::unordered_map<ObjectGuid, ActiveCall> g_active;
+
+bool OnTeam(ObjectGuid masterGuid, ObjectGuid botGuid, SavedTeam team);
+uint8 TeamCount(ObjectGuid masterGuid, SavedTeam team);
+bool GearSetSaved(ObjectGuid botGuid, LoadoutKind kind);
+void EquipSavedSet(Player* master, Player* bot, LoadoutKind kind);
+void AssignToTeam(Player* master, ChatHandler* handler, ObjectGuid botGuid, SavedTeam team, int specNo);
 
 enum GossipSender
 {
@@ -269,12 +324,22 @@ enum GossipSender
     SENDER_CLASS = 3,
     SENDER_SPEC = 4,
     SENDER_DISMISS = 5,
-    SENDER_RECALL = 6,
     SENDER_GEAR = 7,
     SENDER_ARRIVE = 8,
     SENDER_STANCE = 9,
     SENDER_PERSON = 10,
-    SENDER_GENDER = 11
+    SENDER_GENDER = 11,
+    SENDER_TEAMS = 12,
+    SENDER_TEAM = 13,
+    SENDER_TEAM_SUMMON = 14,
+    SENDER_TEAM_SAVE = 15,
+    SENDER_TEAM_ADD = 16,
+    SENDER_TEAM_REMOVE = 17,
+    SENDER_TEAM_DROP = 18,
+    SENDER_SET_LIST = 19,
+    SENDER_SET_BOT = 20,
+    SENDER_SET_SAVE = 21,
+    SENDER_SET_EQUIP = 22
 };
 
 constexpr uint32 PERSON_NEW = 0;
@@ -333,6 +398,19 @@ RaceChoice const* FindRaceToken(std::string const& token)
         if (TokenIn(token, choice.tokens))
             return &choice;
     return nullptr;
+}
+
+TeamChoice const* FindTeam(SavedTeam team)
+{
+    for (TeamChoice const& choice : kTeams)
+        if (choice.team == team)
+            return &choice;
+    return nullptr;
+}
+
+LoadoutKind KindFor(SavedTeam team)
+{
+    return team == SavedTeam::Dungeon ? LoadoutKind::Pve : LoadoutKind::Pvp;
 }
 
 ActivityChoice const* FindActivity(RecruitActivity activity)
@@ -574,14 +652,12 @@ void RememberRecruit(ObjectGuid botGuid, RecruitRequest const& request, ObjectGu
     pending.stance = request.stance;
     pending.activity = request.activity;
     pending.startedMs = getMSTime();
+    pending.teamSummon = request.teamSummon;
+    pending.assignTeam = request.assignTeam;
+    pending.applySpec = request.applySpec && specNo >= 0;
+    pending.team = request.team;
+    pending.levelBefore = request.levelBefore;
     g_pending[botGuid] = pending;
-}
-
-bool HasSavedParty(ObjectGuid masterGuid)
-{
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT 1 FROM bot_recruiter_hire WHERE master_guid = {} LIMIT 1", masterGuid.GetCounter());
-    return bool(result);
 }
 
 void SaveHire(PendingRecruit const& pending, ObjectGuid botGuid)
@@ -720,11 +796,32 @@ void ApplyPendingSpecs()
                 pending.loginFinished = true;
             else
             {
-                PlayerbotFactory::InitTalentsBySpecNo(bot, pending.specNo, true);
-                ApplyGear(master, bot, pending.gear);
+                if (pending.applySpec)
+                    PlayerbotFactory::InitTalentsBySpecNo(bot, pending.specNo, true);
+                if (pending.teamSummon)
+                {
+                    if (GearSetSaved(botGuid, KindFor(pending.team)))
+                        EquipSavedSet(master, bot, KindFor(pending.team));
+                    if (pending.levelBefore != 0 && bot->GetLevel() != pending.levelBefore)
+                    {
+                        std::string name;
+                        sCharacterCache->GetCharacterNameByGuid(botGuid, name);
+                        std::string text = (name.empty() ? "A team member" : name) + " was raised to your level.";
+                        if (pending.applySpec || GearSetSaved(botGuid, KindFor(pending.team)))
+                            text += " Their saved build was put back.";
+                        ChatHandler chat(master->GetSession());
+                        Tell(&chat, text);
+                    }
+                    g_active[botGuid] = ActiveCall{pending.masterGuid, pending.team};
+                }
+                else
+                    ApplyGear(master, bot, pending.gear);
+                if (pending.assignTeam)
+                    g_active[botGuid] = ActiveCall{pending.masterGuid, pending.team};
                 ApplyOrders(master, bot, pending.summon, pending.stance);
                 bot->SaveToDB(false, false);
-                SaveHire(pending, botGuid);
+                if (!pending.teamSummon)
+                    SaveHire(pending, botGuid);
                 pending.specApplied = true;
                 pending.appliedMs = getMSTime();
             }
@@ -812,13 +909,25 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
         return false;
     }
 
+    if (request.assignTeam)
+    {
+        TeamChoice const* teamChoice = FindTeam(request.team);
+        bool already = !request.preferred.IsEmpty() && OnTeam(master->GetGUID(), request.preferred, request.team);
+        if (teamChoice && !already && TeamCount(master->GetGUID(), request.team) >= teamChoice->cap)
+        {
+            Tell(handler, std::string(teamChoice->label) + " already has " + std::to_string(teamChoice->cap) + " members.");
+            return false;
+        }
+    }
+
     bool alliance = master->GetTeamId(true) == TEAM_ALLIANCE;
     std::unordered_set<ObjectGuid> const& guidCache =
         sRandomPlayerbotMgr.addclassCache[RandomPlayerbotMgr::GetTeamClassIdx(alliance, cls)];
 
     auto const eligible = [&](ObjectGuid const& guid) -> bool { return EligibleBot(guid, race); };
 
-    int specNo = request.specNo >= 0 ? request.specNo : SpecNumber(classChoice->trees[tree], activity);
+    int specNo = request.teamSummon ? request.specNo
+                                   : (request.specNo >= 0 ? request.specNo : SpecNumber(classChoice->trees[tree], activity));
     GearChoice const* gearChoice = FindGear(request.gear);
     StanceChoice const* stanceChoice = FindStance(request.stance);
     std::string notice = std::string("Recruiting a ") + raceChoice->label + " " + classChoice->label + " for " +
@@ -826,8 +935,8 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
                          (gearChoice ? gearChoice->label : "Leave their gear") + ". Orders: " +
                          (request.summon ? "meet you, " : "stay put, ") +
                          (stanceChoice ? stanceChoice->label : "Damage") + ".";
-    if (request.specNo >= 0)
-        notice = "Bringing a saved recruit back.";
+    if (request.teamSummon)
+        notice.clear();
 
     ObjectGuid picked = request.preferred;
     if (request.createNew)
@@ -878,10 +987,13 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
                                              return;
 
                                          RememberRecruit(guid, saved, masterGuid, specNo);
+                                         if (saved.assignTeam)
+                                             AssignToTeam(masterNow, nullptr, guid, saved.team, specNo);
                                          if (PlayerbotMgr* botMgr = GET_PLAYERBOT_MGR(masterNow))
                                              botMgr->AddPlayerBot(guid, masterAccountId);
                                          ChatHandler chat(masterNow->GetSession());
-                                         chat.PSendSysMessage("{}", notice);
+                                         if (!notice.empty())
+                                             chat.PSendSysMessage("{}", notice);
                                      }))
         {
             Tell(handler, "No available character of that race and class.");
@@ -893,8 +1005,11 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
     }
 
     RememberRecruit(picked, request, master->GetGUID(), specNo);
+    if (request.assignTeam)
+        AssignToTeam(master, handler, picked, request.team, specNo);
     mgr->AddPlayerBot(picked, master->GetSession()->GetAccountId());
-    Tell(handler, notice);
+    if (!notice.empty())
+        Tell(handler, notice);
     return true;
 }
 
@@ -902,8 +1017,7 @@ void ShowActivities(Player* player, Creature* creature)
 {
     ClearGossipMenuFor(player);
     g_menu[player->GetGUID()] = MenuState();
-    if (HasSavedParty(player->GetGUID()))
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Bring them back", SENDER_RECALL, 0);
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "My teams", SENDER_TEAMS, 0);
     for (ActivityChoice const& choice : kActivities)
         AddGossipItemFor(player, GOSSIP_ICON_BATTLE, choice.label, SENDER_ACTIVITY, uint32(choice.activity));
     AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Send them away", SENDER_DISMISS, 0);
@@ -1034,47 +1148,422 @@ RecruitRequest RequestFromMenu(MenuState const& state)
     request.gear = state.gear;
     request.summon = state.summon;
     request.stance = state.stance;
+    request.assignTeam = state.assignTeam;
+    request.team = state.team;
     return request;
 }
 
-bool RecallParty(Player* master, ChatHandler* handler)
+bool OnTeam(ObjectGuid masterGuid, ObjectGuid botGuid, SavedTeam team)
+{
+    if (botGuid.IsEmpty())
+        return false;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT 1 FROM bot_recruiter_team WHERE master_guid = {} AND team = {} AND bot_guid = {} LIMIT 1",
+        masterGuid.GetCounter(), uint32(team), botGuid.GetCounter());
+    return bool(result);
+}
+
+uint8 TeamCount(ObjectGuid masterGuid, SavedTeam team)
 {
     QueryResult result = CharacterDatabase.Query(
-        "SELECT bot_guid, spec_no, gear_band, summon, stance, activity FROM bot_recruiter_hire "
-        "WHERE master_guid = {} ORDER BY slot",
-        master->GetGUID().GetCounter());
+        "SELECT slot FROM bot_recruiter_team WHERE master_guid = {} AND team = {}", masterGuid.GetCounter(),
+        uint32(team));
+    if (!result)
+        return 0;
+
+    uint8 count = 0;
+    do
+    {
+        ++count;
+    } while (result->NextRow());
+    return count;
+}
+
+bool GearSetSaved(ObjectGuid botGuid, LoadoutKind kind)
+{
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT gear_saved FROM bot_recruiter_loadout WHERE bot_guid = {} AND kind = {} LIMIT 1", botGuid.GetCounter(),
+        uint32(kind));
+    return result && (*result)[0].Get<uint8>() != 0;
+}
+
+void StoreWornSet(Player* bot, LoadoutKind kind)
+{
+    uint32 botLow = bot->GetGUID().GetCounter();
+    int specNo = -1;
+    QueryResult row = CharacterDatabase.Query(
+        "SELECT spec_no FROM bot_recruiter_loadout WHERE bot_guid = {} AND kind = {}", botLow, uint32(kind));
+    if (row)
+        specNo = (*row)[0].Get<int32>();
+
+    CharacterDatabase.DirectExecute("DELETE FROM bot_recruiter_loadout_item WHERE bot_guid = {} AND kind = {}", botLow,
+                                    uint32(kind));
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item)
+            continue;
+
+        CharacterDatabase.DirectExecute(
+            "REPLACE INTO bot_recruiter_loadout_item (bot_guid, kind, equip_slot, item_guid, item_entry) "
+            "VALUES ({}, {}, {}, {}, {})",
+            botLow, uint32(kind), uint32(slot), item->GetGUID().GetCounter(), item->GetEntry());
+    }
+
+    CharacterDatabase.DirectExecute(
+        "REPLACE INTO bot_recruiter_loadout (bot_guid, kind, spec_no, gear_saved) VALUES ({}, {}, {}, 1)", botLow,
+        uint32(kind), specNo);
+}
+
+void MaybeUpdateSet(Player* bot, LoadoutKind kind)
+{
+    if (!bot)
+        return;
+
+    if (!GearSetSaved(bot->GetGUID(), kind))
+    {
+        StoreWornSet(bot, kind);
+        return;
+    }
+
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT equip_slot, item_guid FROM bot_recruiter_loadout_item WHERE bot_guid = {} AND kind = {}",
+        bot->GetGUID().GetCounter(), uint32(kind));
+    if (rows)
+    {
+        do
+        {
+            Field* fields = rows->Fetch();
+            Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, fields[0].Get<uint8>());
+            if (!worn || worn->GetGUID().GetCounter() != fields[1].Get<uint32>())
+                return;
+        } while (rows->NextRow());
+    }
+
+    StoreWornSet(bot, kind);
+}
+
+void SnapshotActiveSets(Player* master)
+{
+    if (!master)
+        return;
+
+    std::vector<ObjectGuid> mine;
+    for (auto const& entry : g_active)
+        if (entry.second.master == master->GetGUID())
+            mine.push_back(entry.first);
+
+    for (ObjectGuid guid : mine)
+    {
+        if (Player* bot = ObjectAccessor::FindConnectedPlayer(guid))
+            if (bot->IsInWorld())
+                MaybeUpdateSet(bot, KindFor(g_active[guid].team));
+        g_active.erase(guid);
+    }
+}
+
+void EquipSavedSet(Player* master, Player* bot, LoadoutKind kind)
+{
+    ChatHandler handler(master->GetSession());
+    if (!GearSetSaved(bot->GetGUID(), kind))
+    {
+        Tell(&handler, "That character has no saved set of that kind yet.");
+        return;
+    }
+
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT equip_slot, item_guid FROM bot_recruiter_loadout_item WHERE bot_guid = {} AND kind = {}",
+        bot->GetGUID().GetCounter(), uint32(kind));
+    if (!rows)
+        return;
+
+    uint32 missing = 0;
+    do
+    {
+        Field* fields = rows->Fetch();
+        uint8 slot = fields[0].Get<uint8>();
+        Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(fields[1].Get<uint32>()));
+        if (!item)
+        {
+            ++missing;
+            continue;
+        }
+
+        Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (worn && worn->GetGUID() == item->GetGUID())
+            continue;
+
+        uint16 dest = 0;
+        if (bot->CanEquipItem(slot, dest, item, true) != EQUIP_ERR_OK)
+        {
+            ++missing;
+            continue;
+        }
+        bot->EquipItem(dest, item, true);
+    } while (rows->NextRow());
+
+    if (missing)
+        Tell(&handler, "Some pieces of the saved set are gone, so those slots were left alone.");
+}
+
+void AssignToTeam(Player* master, ChatHandler* handler, ObjectGuid botGuid, SavedTeam team, int specNo)
+{
+    TeamChoice const* choice = FindTeam(team);
+    if (!master || !choice || botGuid.IsEmpty())
+        return;
+
+    uint32 masterLow = master->GetGUID().GetCounter();
+    uint32 botLow = botGuid.GetCounter();
+    LoadoutKind kind = KindFor(team);
+    int storedSpec = specNo;
+    uint8 gearSaved = 0;
+    QueryResult loadout = CharacterDatabase.Query(
+        "SELECT spec_no, gear_saved FROM bot_recruiter_loadout WHERE bot_guid = {} AND kind = {}", botLow, uint32(kind));
+    if (loadout)
+    {
+        if (specNo < 0)
+            storedSpec = (*loadout)[0].Get<int32>();
+        gearSaved = (*loadout)[1].Get<uint8>();
+    }
+
+    CharacterDatabase.DirectExecute(
+        "REPLACE INTO bot_recruiter_loadout (bot_guid, kind, spec_no, gear_saved) VALUES ({}, {}, {}, {})", botLow,
+        uint32(kind), storedSpec, uint32(gearSaved));
+
+    if (OnTeam(master->GetGUID(), botGuid, team))
+        return;
+
+    if (TeamCount(master->GetGUID(), team) >= choice->cap)
+    {
+        Tell(handler, std::string(choice->label) + " already has " + std::to_string(choice->cap) + " members.");
+        return;
+    }
+
+    uint8 slot = 0;
+    QueryResult slots = CharacterDatabase.Query(
+        "SELECT slot FROM bot_recruiter_team WHERE master_guid = {} AND team = {} ORDER BY slot", masterLow, uint32(team));
+    if (slots)
+    {
+        do
+        {
+            if ((*slots)[0].Get<uint8>() != slot)
+                break;
+            ++slot;
+        } while (slots->NextRow());
+    }
+
+    CharacterDatabase.DirectExecute(
+        "REPLACE INTO bot_recruiter_team (master_guid, team, slot, bot_guid) VALUES ({}, {}, {}, {})", masterLow,
+        uint32(team), uint32(slot), botLow);
+}
+
+bool SummonTeam(Player* master, ChatHandler* handler, SavedTeam team)
+{
+    TeamChoice const* choice = FindTeam(team);
+    if (!master || !choice)
+        return false;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT bot_guid FROM bot_recruiter_team WHERE master_guid = {} AND team = {} ORDER BY slot",
+        master->GetGUID().GetCounter(), uint32(team));
     if (!result)
     {
-        Tell(handler, "There is no party to bring back.");
+        Tell(handler, std::string("Your ") + choice->label + " team has no members.");
         return false;
     }
 
-    uint32 brought = 0;
+    PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(master);
+    ActivityChoice const* activityChoice = FindActivity(choice->activity);
+    uint32 called = 0;
+    uint32 skipped = 0;
+    uint32 waiting = 0;
     do
     {
-        Field* fields = result->Fetch();
-        ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(fields[0].Get<uint32>());
+        ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>((*result)[0].Get<uint32>());
+        if ((mgr && mgr->GetPlayerBot(guid)) || g_pending.find(guid) != g_pending.end())
+        {
+            ++skipped;
+            continue;
+        }
+
+        if (activityChoice && activityChoice->capAtFive && ReservedSlots(master) >= 5)
+        {
+            ++waiting;
+            continue;
+        }
+
         CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(guid);
         if (!entry || !EligibleBot(guid, entry->Race))
             continue;
 
+        int specNo = -1;
+        QueryResult spec = CharacterDatabase.Query(
+            "SELECT spec_no FROM bot_recruiter_loadout WHERE bot_guid = {} AND kind = {}", guid.GetCounter(),
+            uint32(KindFor(team)));
+        if (spec)
+            specNo = (*spec)[0].Get<int32>();
+
         RecruitRequest request;
         request.cls = entry->Class;
         request.race = entry->Race;
-        request.activity = RecruitActivity(fields[5].Get<uint8>());
-        request.tree = 0;
-        request.gear = GearBand(fields[2].Get<uint8>());
-        request.summon = fields[3].Get<uint8>() != 0;
-        request.stance = RecruitStance(fields[4].Get<uint8>());
+        request.activity = choice->activity;
+        request.gear = GearBand::Stored;
+        request.summon = true;
         request.preferred = guid;
-        request.specNo = fields[1].Get<int32>();
+        request.specNo = specNo;
+        request.teamSummon = true;
+        request.applySpec = specNo >= 0;
+        request.team = team;
+        request.levelBefore = sCharacterCache->GetCharacterLevelByGuid(guid);
         if (Recruit(master, handler, request))
-            ++brought;
+            ++called;
     } while (result->NextRow());
 
-    if (!brought)
-        Tell(handler, "None of that party is free to join.");
-    return brought != 0;
+    if (called)
+        Tell(handler, std::string("Calling your ") + choice->label + " team.");
+    else if (!skipped && !waiting)
+        Tell(handler, "None of that team is free to join.");
+    if (skipped)
+        Tell(handler, std::to_string(skipped) + " already with you were left as they are.");
+    if (waiting)
+        Tell(handler, std::to_string(waiting) + " stayed behind because the party is full.");
+    return called != 0;
+}
+
+void SaveGroupAsTeam(Player* master, ChatHandler* handler, SavedTeam team)
+{
+    TeamChoice const* choice = FindTeam(team);
+    Group* group = master ? master->GetGroup() : nullptr;
+    if (!choice)
+        return;
+    if (!group)
+    {
+        Tell(handler, "You are not in a group.");
+        return;
+    }
+
+    uint32 masterLow = master->GetGUID().GetCounter();
+    CharacterDatabase.DirectExecute("DELETE FROM bot_recruiter_team WHERE master_guid = {} AND team = {}", masterLow,
+                                    uint32(team));
+
+    uint8 slot = 0;
+    for (GroupReference* ref = group->GetFirstMember(); ref && slot < choice->cap; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == master || !sRandomPlayerbotMgr.IsAddclassBot(member->GetGUID().GetCounter()))
+            continue;
+
+        uint32 botLow = member->GetGUID().GetCounter();
+        CharacterDatabase.DirectExecute(
+            "REPLACE INTO bot_recruiter_team (master_guid, team, slot, bot_guid) VALUES ({}, {}, {}, {})", masterLow,
+            uint32(team), uint32(slot), botLow);
+
+        LoadoutKind kind = KindFor(team);
+        QueryResult existing = CharacterDatabase.Query(
+            "SELECT 1 FROM bot_recruiter_loadout WHERE bot_guid = {} AND kind = {}", botLow, uint32(kind));
+        if (!existing)
+            CharacterDatabase.DirectExecute(
+                "INSERT INTO bot_recruiter_loadout (bot_guid, kind, spec_no, gear_saved) VALUES ({}, {}, -1, 0)", botLow,
+                uint32(kind));
+
+        ++slot;
+    }
+
+    Tell(handler, "Saved " + std::to_string(slot) + " members to your " + choice->label + " team.");
+}
+
+void ShowTeams(Player* player, Creature* creature)
+{
+    ClearGossipMenuFor(player);
+    for (TeamChoice const& choice : kTeams)
+        AddGossipItemFor(player, GOSSIP_ICON_BATTLE, choice.label, SENDER_TEAM, uint32(choice.team));
+    SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
+}
+
+void ShowTeam(Player* player, Creature* creature, SavedTeam team)
+{
+    if (!FindTeam(team))
+        return;
+
+    MenuState& state = g_menu[player->GetGUID()];
+    state.team = team;
+    state.assignTeam = false;
+    ClearGossipMenuFor(player);
+    AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Summon team", SENDER_TEAM_SUMMON, uint32(team));
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Save my group", SENDER_TEAM_SAVE, uint32(team));
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Add a member", SENDER_TEAM_ADD, uint32(team));
+    AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Remove a member", SENDER_TEAM_REMOVE, uint32(team));
+    AddGossipItemFor(player, GOSSIP_ICON_VENDOR, "Gear sets", SENDER_SET_LIST, uint32(team));
+    SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
+}
+
+void ShowTeamMembers(Player* player, Creature* creature, SavedTeam team)
+{
+    ClearGossipMenuFor(player);
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT bot_guid FROM bot_recruiter_team WHERE master_guid = {} AND team = {} ORDER BY slot",
+        player->GetGUID().GetCounter(), uint32(team));
+    if (result)
+    {
+        do
+        {
+            ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>((*result)[0].Get<uint32>());
+            std::string name;
+            if (!sCharacterCache->GetCharacterNameByGuid(guid, name))
+                name = "Unknown";
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, name, SENDER_TEAM_DROP, guid.GetCounter());
+        } while (result->NextRow());
+    }
+    else
+    {
+        ChatHandler handler(player->GetSession());
+        Tell(&handler, "That team has no members.");
+        CloseGossipMenuFor(player);
+        return;
+    }
+    SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
+}
+
+void ShowSetBots(Player* player, Creature* creature)
+{
+    ClearGossipMenuFor(player);
+    PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+    bool any = false;
+    if (mgr)
+    {
+        for (PlayerBotMap::const_iterator itr = mgr->GetPlayerBotsBegin(); itr != mgr->GetPlayerBotsEnd(); ++itr)
+        {
+            std::string name;
+            if (!sCharacterCache->GetCharacterNameByGuid(itr->first, name) && itr->second)
+                name = itr->second->GetName();
+            if (name.empty())
+                continue;
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, name, SENDER_SET_BOT, itr->first.GetCounter());
+            any = true;
+        }
+    }
+    if (!any)
+    {
+        ChatHandler handler(player->GetSession());
+        Tell(&handler, "None of your recruits are here to change sets.");
+        CloseGossipMenuFor(player);
+        return;
+    }
+    SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
+}
+
+void ShowSetActions(Player* player, Creature* creature, ObjectGuid botGuid)
+{
+    g_menu[player->GetGUID()].setBot = botGuid;
+    ClearGossipMenuFor(player);
+    AddGossipItemFor(player, GOSSIP_ICON_VENDOR, "Save what they are wearing as the PvE set", SENDER_SET_SAVE,
+                     uint32(LoadoutKind::Pve));
+    AddGossipItemFor(player, GOSSIP_ICON_VENDOR, "Save what they are wearing as the PvP set", SENDER_SET_SAVE,
+                     uint32(LoadoutKind::Pvp));
+    AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Equip the PvE set", SENDER_SET_EQUIP, uint32(LoadoutKind::Pve));
+    AddGossipItemFor(player, GOSSIP_ICON_BATTLE, "Equip the PvP set", SENDER_SET_EQUIP, uint32(LoadoutKind::Pvp));
+    SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
 }
 
 }  // namespace
@@ -1085,6 +1574,17 @@ public:
     bot_recruiter_worldscript() : WorldScript("bot_recruiter_worldscript", {uint16(WORLDHOOK_ON_UPDATE)}) {}
 
     void OnUpdate(uint32 /*diff*/) override { ApplyPendingSpecs(); }
+};
+
+class bot_recruiter_playerscript : public PlayerScript
+{
+public:
+    bot_recruiter_playerscript()
+        : PlayerScript("bot_recruiter_playerscript", {uint16(PLAYERHOOK_ON_BEFORE_LOGOUT)})
+    {
+    }
+
+    void OnPlayerBeforeLogout(Player* player) override { SnapshotActiveSets(player); }
 };
 
 class bot_recruiter_commandscript : public CommandScript
@@ -1195,9 +1695,127 @@ public:
     {
         if (sender == SENDER_DISMISS)
         {
+            SnapshotActiveSets(player);
             char args[] = "remove *";
             ChatHandler handler(player->GetSession());
             PlayerbotMgr::HandlePlayerbotMgrCommand(&handler, args);
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        if (sender == SENDER_TEAMS)
+        {
+            ShowTeams(player, creature);
+            return true;
+        }
+
+        if (sender == SENDER_TEAM)
+        {
+            if (!FindTeam(SavedTeam(action)))
+                return true;
+            ShowTeam(player, creature, SavedTeam(action));
+            return true;
+        }
+
+        if (sender == SENDER_TEAM_SUMMON)
+        {
+            if (!FindTeam(SavedTeam(action)))
+                return true;
+            ChatHandler handler(player->GetSession());
+            SummonTeam(player, &handler, SavedTeam(action));
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        if (sender == SENDER_TEAM_SAVE)
+        {
+            if (!FindTeam(SavedTeam(action)))
+                return true;
+            ChatHandler handler(player->GetSession());
+            SaveGroupAsTeam(player, &handler, SavedTeam(action));
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        if (sender == SENDER_TEAM_ADD)
+        {
+            TeamChoice const* teamChoice = FindTeam(SavedTeam(action));
+            if (!teamChoice)
+                return true;
+            MenuState& adding = g_menu[player->GetGUID()];
+            adding.team = teamChoice->team;
+            adding.activity = teamChoice->activity;
+            adding.assignTeam = true;
+            ShowRaces(player, creature);
+            return true;
+        }
+
+        if (sender == SENDER_TEAM_REMOVE)
+        {
+            if (!FindTeam(SavedTeam(action)))
+                return true;
+            g_menu[player->GetGUID()].team = SavedTeam(action);
+            ShowTeamMembers(player, creature, SavedTeam(action));
+            return true;
+        }
+
+        if (sender == SENDER_TEAM_DROP)
+        {
+            ObjectGuid botGuid = ObjectGuid::Create<HighGuid::Player>(action);
+            ChatHandler handler(player->GetSession());
+            CharacterDatabase.DirectExecute(
+                "DELETE FROM bot_recruiter_team WHERE master_guid = {} AND team = {} AND bot_guid = {}",
+                player->GetGUID().GetCounter(), uint32(g_menu[player->GetGUID()].team), botGuid.GetCounter());
+            std::string name;
+            sCharacterCache->GetCharacterNameByGuid(botGuid, name);
+            Tell(&handler, (name.empty() ? std::string("That character") : name) + " was removed from the team.");
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        if (sender == SENDER_SET_LIST)
+        {
+            ShowSetBots(player, creature);
+            return true;
+        }
+
+        if (sender == SENDER_SET_BOT)
+        {
+            ObjectGuid botGuid = ObjectGuid::Create<HighGuid::Player>(action);
+            PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+            if (!mgr || !mgr->GetPlayerBot(botGuid))
+            {
+                ChatHandler handler(player->GetSession());
+                Tell(&handler, "That recruit is not here.");
+                CloseGossipMenuFor(player);
+                return true;
+            }
+            ShowSetActions(player, creature, botGuid);
+            return true;
+        }
+
+        if (sender == SENDER_SET_SAVE || sender == SENDER_SET_EQUIP)
+        {
+            if (action > uint32(LoadoutKind::Pvp))
+                return true;
+            MenuState const& menu = g_menu[player->GetGUID()];
+            PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(player);
+            Player* bot = mgr ? mgr->GetPlayerBot(menu.setBot) : nullptr;
+            ChatHandler handler(player->GetSession());
+            if (!bot)
+            {
+                Tell(&handler, "That recruit is not here.");
+                CloseGossipMenuFor(player);
+                return true;
+            }
+            LoadoutKind kind = LoadoutKind(action);
+            if (sender == SENDER_SET_SAVE)
+            {
+                StoreWornSet(bot, kind);
+                Tell(&handler, kind == LoadoutKind::Pve ? "Saved the PvE set." : "Saved the PvP set.");
+            }
+            else
+                EquipSavedSet(player, bot, kind);
             CloseGossipMenuFor(player);
             return true;
         }
@@ -1228,14 +1846,6 @@ public:
                 return true;
             state.cls = uint8(action);
             ShowSpecs(player, creature, state.cls);
-            return true;
-        }
-
-        if (sender == SENDER_RECALL)
-        {
-            ChatHandler handler(player->GetSession());
-            RecallParty(player, &handler);
-            CloseGossipMenuFor(player);
             return true;
         }
 
@@ -1324,4 +1934,5 @@ void Addmod_bot_recruiterScripts()
     new bot_recruiter_commandscript();
     new npc_bot_recruiter();
     new bot_recruiter_worldscript();
+    new bot_recruiter_playerscript();
 }
