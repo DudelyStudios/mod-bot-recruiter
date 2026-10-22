@@ -1,0 +1,7 @@
+# Development documentation stays on this machine.
+PLAN.md
+*.plan.md
+/docs/
+
+# Nested checkout of this same repository.
+/mod-bot-recruiter/
