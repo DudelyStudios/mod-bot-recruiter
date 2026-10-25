@@ -727,9 +727,29 @@ void ApplyGear(Player* master, Player* bot, GearBand gear)
         PlayerbotFactory::AutoGear(bot, ITEM_QUALITY_EPIC, choice->itemLevel, false);
 }
 
+// A saved teammate logs in on the map stored in the character row. An instance
+// that is not loaded has no map object, and the login that follows then faults.
+// Write the row onto the master's live map before that login is queried.
+void PlaceBesideMaster(Player* master, ObjectGuid botGuid)
+{
+    if (!master || !master->IsInWorld() || !master->GetMap() || botGuid.IsEmpty())
+        return;
+
+    if (Player* already = ObjectAccessor::FindConnectedPlayer(botGuid))
+        if (already->IsInWorld())
+            return;
+
+    CharacterDatabase.DirectExecute(
+        "UPDATE characters SET map = {}, instance_id = {}, zone = {}, position_x = {}, position_y = {}, "
+        "position_z = {}, orientation = {}, transguid = 0, taxi_path = '' WHERE guid = {} AND online = 0",
+        master->GetMapId(), master->GetInstanceId(), master->GetZoneId(), master->GetPositionX(),
+        master->GetPositionY(), master->GetPositionZ(), master->GetOrientation(), botGuid.GetCounter());
+}
+
 void ApplyOrders(Player* master, Player* bot, bool summon, RecruitStance stance)
 {
-    if (summon)
+    if (summon && master->IsInWorld() && master->GetMap() && master->GetSession() &&
+        !master->GetSession()->IsLoggingOut() && bot->IsInWorld() && bot->GetMap())
         bot->TeleportTo(master->GetMapId(), master->GetPositionX(), master->GetPositionY(), master->GetPositionZ(),
                         master->GetOrientation());
 
@@ -796,7 +816,7 @@ void ApplyPendingSpecs()
                 pending.loginFinished = true;
             else
             {
-                if (pending.applySpec)
+                if (pending.applySpec && pending.specNo < MAX_SPECNO && bot->getClass() < MAX_CLASSES && bot->GetMap())
                     PlayerbotFactory::InitTalentsBySpecNo(bot, pending.specNo, true);
                 if (pending.teamSummon)
                 {
@@ -818,6 +838,13 @@ void ApplyPendingSpecs()
                     ApplyGear(master, bot, pending.gear);
                 if (pending.assignTeam)
                     g_active[botGuid] = ActiveCall{pending.masterGuid, pending.team};
+                // Login builds combat strategies before these talents exist. The
+                // dungeon finder asks playerbots for a role, and that answer is
+                // the tank or heal strategy, so rebuild it from the spec now.
+                // ApplyOrders runs after, because the rebuild clears follow.
+                if (pending.applySpec)
+                    if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+                        botAI->ResetStrategies();
                 ApplyOrders(master, bot, pending.summon, pending.stance);
                 bot->SaveToDB(false, false);
                 if (!pending.teamSummon)
@@ -1007,6 +1034,7 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
     RememberRecruit(picked, request, master->GetGUID(), specNo);
     if (request.assignTeam)
         AssignToTeam(master, handler, picked, request.team, specNo);
+    PlaceBesideMaster(master, picked);
     mgr->AddPlayerBot(picked, master->GetSession()->GetAccountId());
     if (!notice.empty())
         Tell(handler, notice);
@@ -1265,6 +1293,9 @@ void SnapshotActiveSets(Player* master)
 
 void EquipSavedSet(Player* master, Player* bot, LoadoutKind kind)
 {
+    if (!master->GetSession() || !bot->IsInWorld())
+        return;
+
     ChatHandler handler(master->GetSession());
     if (!GearSetSaved(bot->GetGUID(), kind))
     {
