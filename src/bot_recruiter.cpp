@@ -606,7 +606,7 @@ bool CreateAddclassCharacter(uint8 race, uint8 cls, uint8 gender, WorldSession* 
     return true;
 }
 
-bool EligibleBot(ObjectGuid guid, uint8 race)
+bool EligibleBot(ObjectGuid guid, uint8 race, Player const* master = nullptr)
 {
     if (g_pending.find(guid) != g_pending.end())
         return false;
@@ -614,8 +614,11 @@ bool EligibleBot(ObjectGuid guid, uint8 race)
         return false;
     if (ObjectAccessor::FindConnectedPlayer(guid))
         return false;
+    // A guild led by a real player is left alone, except the guild of the
+    // player doing the hiring. Their own recruits may wear their tabard.
     uint32 guildId = sCharacterCache->GetCharacterGuildIdByGuid(guid);
-    if (guildId && PlayerbotGuildMgr::instance().IsRealGuild(guildId))
+    if (guildId && PlayerbotGuildMgr::instance().IsRealGuild(guildId) &&
+        (!master || master->GetGuildId() != guildId))
         return false;
     if (!sRandomPlayerbotMgr.IsAddclassBot(guid.GetCounter()))
         return false;
@@ -951,7 +954,7 @@ bool Recruit(Player* master, ChatHandler* handler, RecruitRequest const& request
     std::unordered_set<ObjectGuid> const& guidCache =
         sRandomPlayerbotMgr.addclassCache[RandomPlayerbotMgr::GetTeamClassIdx(alliance, cls)];
 
-    auto const eligible = [&](ObjectGuid const& guid) -> bool { return EligibleBot(guid, race); };
+    auto const eligible = [&](ObjectGuid const& guid) -> bool { return EligibleBot(guid, race, master); };
 
     int specNo = request.teamSummon ? request.specNo
                                    : (request.specNo >= 0 ? request.specNo : SpecNumber(classChoice->trees[tree], activity));
@@ -1136,7 +1139,7 @@ void ShowPeople(Player* player, Creature* creature)
     std::vector<std::pair<std::string, ObjectGuid>> named;
     for (ObjectGuid const& guid : guidCache)
     {
-        if (!EligibleBot(guid, state.race))
+        if (!EligibleBot(guid, state.race, player))
             continue;
         std::string name;
         if (!sCharacterCache->GetCharacterNameByGuid(guid, name))
@@ -1425,7 +1428,7 @@ bool SummonTeam(Player* master, ChatHandler* handler, SavedTeam team)
         }
 
         CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(guid);
-        if (!entry || !EligibleBot(guid, entry->Race))
+        if (!entry || !EligibleBot(guid, entry->Race, master))
             continue;
 
         int specNo = -1;
@@ -1925,7 +1928,7 @@ public:
             }
 
             ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(action);
-            if (!EligibleBot(guid, state.race))
+            if (!EligibleBot(guid, state.race, player))
             {
                 ChatHandler handler(player->GetSession());
                 Tell(&handler, "That recruit is not available.");
