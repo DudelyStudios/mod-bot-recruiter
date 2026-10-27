@@ -10,6 +10,7 @@
  * builds on those characters, are stored in their own tables.
  */
 
+#include "BattlegroundMgr.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "CommandScript.h"
@@ -36,7 +37,11 @@
 #include "WorldScript.h"
 #include "WorldSession.h"
 
+#include "Log.h"
+#include "MapMgr.h"
+
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <functional>
 #include <sstream>
@@ -1600,12 +1605,258 @@ void ShowSetActions(Player* player, Creature* creature, ObjectGuid botGuid)
     SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature);
 }
 
+// BattlegroundQueue::AddGroup aborts the process when a member is already in
+// that queue's map. A recruit can be left there by an earlier queue while the
+// character itself no longer counts as queued, and a recruit who queued on
+// their own blocks the whole party. Take recruits out before the core checks
+// the group. A real player's own queue is left alone unless it is one of
+// those leftover map entries.
+void LeaveBotBattlegroundQueues(Player* bot)
+{
+    if (!bot || !GET_PLAYERBOT_AI(bot))
+        return;
+
+    for (uint32 queueId = BATTLEGROUND_QUEUE_AV; queueId < MAX_BATTLEGROUND_QUEUE_TYPES; ++queueId)
+    {
+        BattlegroundQueueTypeId queueTypeId = BattlegroundQueueTypeId(queueId);
+        bool listed = bot->InBattlegroundQueueForBattlegroundQueueType(queueTypeId);
+        BattlegroundQueue& queue = sBattlegroundMgr->GetBattlegroundQueue(queueTypeId);
+        GroupQueueInfo info;
+        bool inQueue = queue.GetPlayerGroupInfoData(bot->GetGUID(), &info);
+        if (listed)
+            bot->RemoveBattlegroundQueueId(queueTypeId);
+        if (inQueue)
+            queue.RemovePlayer(bot->GetGUID(), true);
+    }
+}
+
+void DropStaleBattlegroundQueueEntries(Player* member)
+{
+    if (!member)
+        return;
+
+    for (uint32 queueId = BATTLEGROUND_QUEUE_AV; queueId < MAX_BATTLEGROUND_QUEUE_TYPES; ++queueId)
+    {
+        BattlegroundQueueTypeId queueTypeId = BattlegroundQueueTypeId(queueId);
+        if (member->InBattlegroundQueueForBattlegroundQueueType(queueTypeId))
+            continue;
+
+        BattlegroundQueue& queue = sBattlegroundMgr->GetBattlegroundQueue(queueTypeId);
+        GroupQueueInfo info;
+        if (!queue.GetPlayerGroupInfoData(member->GetGUID(), &info))
+            continue;
+
+        queue.RemovePlayer(member->GetGUID(), true);
+    }
+}
+
+// mod-unbound rewrites Mentor spawns 9000101-9000109 back onto the bank steps
+// whenever its spawn file is applied. A rebuild can do that after this module
+// has saved positions. On every world start, stand each Mentor and each
+// sergeant on the Portal Master (entry 190000) that is actually in the world.
+constexpr uint32 PORTAL_MASTER_ENTRY = 190000;
+constexpr uint32 MENTOR_ENTRY = 900001;
+constexpr float STATION_RANGE = 400.f;
+constexpr float STATION_YARDS = 4.5f;
+
+struct StationNpc
+{
+    ObjectGuid::LowType guid;
+    uint32 entry;
+    uint16 map;
+    float x;
+    float y;
+    float z;
+    float o;
+};
+
+float StationDistance(StationNpc const& a, StationNpc const& b)
+{
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+void StationOffset(StationNpc const& portal, int side, float& x, float& y)
+{
+    float dist = STATION_YARDS;
+    if (side == 0)
+    {
+        x = portal.x - std::cos(portal.o) * dist;
+        y = portal.y - std::sin(portal.o) * dist;
+        return;
+    }
+    x = portal.x - std::sin(portal.o) * dist * float(side);
+    y = portal.y + std::cos(portal.o) * dist * float(side);
+}
+
+void MoveStationNpc(StationNpc const& npc, float x, float y, float z, float o)
+{
+    if (std::fabs(npc.x - x) < 0.75f && std::fabs(npc.y - y) < 0.75f && std::fabs(npc.z - z) < 0.75f)
+        return;
+
+    CreatureData& data = sObjectMgr->NewOrExistCreatureData(npc.guid);
+    sObjectMgr->RemoveCreatureFromGrid(npc.guid, &data);
+    data.posX = x;
+    data.posY = y;
+    data.posZ = z;
+    data.orientation = o;
+    sObjectMgr->AddCreatureToGrid(npc.guid, &data);
+    WorldDatabase.DirectExecute(
+        "UPDATE creature SET position_x = {}, position_y = {}, position_z = {}, orientation = {} "
+        "WHERE guid = {} AND id = {}",
+        x, y, z, o, npc.guid, npc.entry);
+
+    if (Map* map = sMapMgr->FindMap(npc.map, 0))
+    {
+        auto bounds = map->GetCreatureBySpawnIdStore().equal_range(npc.guid);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+            if (Creature* creature = it->second)
+                if (creature->IsInWorld())
+                    creature->NearTeleportTo(x, y, z, o);
+    }
+}
+
+void SpawnStationMentor(StationNpc const& portal, float x, float y)
+{
+    if (!sObjectMgr->GetCreatureTemplate(MENTOR_ENTRY))
+        return;
+
+    ObjectGuid::LowType guid = 0;
+    for (uint32 candidate = 9000110; candidate <= 9000129; ++candidate)
+        if (!sObjectMgr->GetCreatureData(candidate))
+        {
+            guid = candidate;
+            break;
+        }
+    if (!guid)
+        return;
+
+    WorldDatabase.DirectExecute(
+        "INSERT INTO creature (guid, id, map, zoneId, areaId, spawnMask, phaseMask, equipment_id, "
+        "position_x, position_y, position_z, orientation, spawntimesecs, wander_distance, currentwaypoint, "
+        "curhealth, curmana, MovementType, npcflag, unit_flags, dynamicflags, ScriptName, VerifiedBuild, "
+        "CreateObject, Comment) VALUES ({}, {}, {}, 0, 0, 1, 1, 0, {}, {}, {}, {}, 300, 0, 0, 1, 0, 0, 0, 0, 0, "
+        "'', NULL, 0, 'Mentor stationed with a Portal Master')",
+        guid, MENTOR_ENTRY, portal.map, x, y, portal.z, portal.o);
+
+    if (CreatureData const* loaded = sObjectMgr->LoadCreatureDataFromDB(guid))
+        sObjectMgr->AddCreatureToGrid(guid, loaded);
+}
+
+void StationHubs()
+{
+    std::vector<StationNpc> portals;
+    std::vector<StationNpc> mentors;
+    std::vector<StationNpc> recruiters;
+    for (auto const& [guid, data] : sObjectMgr->GetAllCreatureData())
+    {
+        StationNpc npc{guid, data.id, data.mapid, data.posX, data.posY, data.posZ, data.orientation};
+        if (data.id == PORTAL_MASTER_ENTRY)
+            portals.push_back(npc);
+        else if (data.id == MENTOR_ENTRY)
+            mentors.push_back(npc);
+        else if (data.id >= 900101 && data.id <= 900108)
+            recruiters.push_back(npc);
+    }
+    if (portals.empty())
+        return;
+
+    struct Claim
+    {
+        float dist;
+        size_t hub;
+        size_t npc;
+    };
+    std::vector<Claim> recruiterClaims;
+    for (size_t hub = 0; hub < portals.size(); ++hub)
+        for (size_t npc = 0; npc < recruiters.size(); ++npc)
+            if (recruiters[npc].map == portals[hub].map)
+            {
+                float dist = StationDistance(portals[hub], recruiters[npc]);
+                if (dist <= STATION_RANGE)
+                    recruiterClaims.push_back({dist, hub, npc});
+            }
+    std::sort(recruiterClaims.begin(), recruiterClaims.end(),
+              [](Claim const& a, Claim const& b) { return a.dist < b.dist; });
+
+    std::vector<std::vector<size_t>> sergeants(portals.size());
+    std::unordered_set<size_t> usedRecruiters;
+    for (Claim const& claim : recruiterClaims)
+    {
+        if (usedRecruiters.count(claim.npc) || sergeants[claim.hub].size() >= 2)
+            continue;
+        usedRecruiters.insert(claim.npc);
+        sergeants[claim.hub].push_back(claim.npc);
+    }
+
+    std::vector<Claim> mentorClaims;
+    for (size_t hub = 0; hub < portals.size(); ++hub)
+        for (size_t npc = 0; npc < mentors.size(); ++npc)
+            if (mentors[npc].map == portals[hub].map)
+            {
+                float dist = StationDistance(portals[hub], mentors[npc]);
+                if (dist <= STATION_RANGE)
+                    mentorClaims.push_back({dist, hub, npc});
+            }
+    std::sort(mentorClaims.begin(), mentorClaims.end(),
+              [](Claim const& a, Claim const& b) { return a.dist < b.dist; });
+
+    std::vector<int> mentorOf(portals.size(), -1);
+    std::unordered_set<size_t> usedMentors;
+    for (Claim const& claim : mentorClaims)
+    {
+        if (usedMentors.count(claim.npc) || mentorOf[claim.hub] >= 0)
+            continue;
+        usedMentors.insert(claim.npc);
+        mentorOf[claim.hub] = int(claim.npc);
+    }
+
+    for (size_t hub = 0; hub < portals.size(); ++hub)
+    {
+        StationNpc const& portal = portals[hub];
+        float rightX, rightY, leftX, leftY, backX, backY;
+        StationOffset(portal, 1, rightX, rightY);
+        StationOffset(portal, -1, leftX, leftY);
+        StationOffset(portal, 0, backX, backY);
+
+        bool flanked = sergeants[hub].size() >= 2;
+        for (size_t index = 0; index < sergeants[hub].size(); ++index)
+        {
+            StationNpc const& sergeant = recruiters[sergeants[hub][index]];
+            bool onRight = sergeant.entry <= 900104;
+            if (sergeants[hub].size() == 1)
+                onRight = true;
+            float x = onRight ? rightX : leftX;
+            float y = onRight ? rightY : leftY;
+            MoveStationNpc(sergeant, x, y, portal.z, portal.o);
+        }
+
+        float mentorX = flanked ? backX : leftX;
+        float mentorY = flanked ? backY : leftY;
+        if (mentorOf[hub] >= 0)
+        {
+            MoveStationNpc(mentors[mentorOf[hub]], mentorX, mentorY, portal.z, portal.o);
+        }
+        else
+            SpawnStationMentor(portal, mentorX, mentorY);
+    }
+
+    LOG_INFO("server.loading", "Bot recruiter: stationed mentors and sergeants at {} portal masters.", portals.size());
+}
+
 }  // namespace
 
 class bot_recruiter_worldscript : public WorldScript
 {
 public:
-    bot_recruiter_worldscript() : WorldScript("bot_recruiter_worldscript", {uint16(WORLDHOOK_ON_UPDATE)}) {}
+    bot_recruiter_worldscript()
+        : WorldScript("bot_recruiter_worldscript",
+                      {uint16(WORLDHOOK_ON_STARTUP), uint16(WORLDHOOK_ON_UPDATE)})
+    {
+    }
+
+    void OnStartup() override { StationHubs(); }
 
     void OnUpdate(uint32 /*diff*/) override { ApplyPendingSpecs(); }
 };
@@ -1614,11 +1865,40 @@ class bot_recruiter_playerscript : public PlayerScript
 {
 public:
     bot_recruiter_playerscript()
-        : PlayerScript("bot_recruiter_playerscript", {uint16(PLAYERHOOK_ON_BEFORE_LOGOUT)})
+        : PlayerScript("bot_recruiter_playerscript",
+                       {uint16(PLAYERHOOK_ON_BEFORE_LOGOUT), uint16(PLAYERHOOK_CAN_JOIN_IN_BATTLEGROUND_QUEUE)})
     {
     }
 
     void OnPlayerBeforeLogout(Player* player) override { SnapshotActiveSets(player); }
+
+    // Runs before Group::CanJoinBattlegroundQueue and BattlegroundQueue::AddGroup.
+    // Those two abort the world instead of sending a join error: the first if
+    // the party has no online member, the second if any member is already in
+    // the queue map.
+    bool OnPlayerCanJoinInBattlegroundQueue(Player* player, ObjectGuid /*BattlemasterGuid*/,
+                                             BattlegroundTypeId /*BGTypeID*/, uint8 joinAsGroup,
+                                             GroupJoinBattlegroundResult& err) override
+    {
+        if (!player)
+            return true;
+
+        DropStaleBattlegroundQueueEntries(player);
+
+        Group* group = player->GetGroup();
+        if (!group)
+            return true;
+
+        group->DoForAllMembers([](Player* member) { LeaveBotBattlegroundQueues(member); });
+
+        if (joinAsGroup && !group->GetFirstMember())
+        {
+            err = ERR_BATTLEGROUND_JOIN_FAILED;
+            return false;
+        }
+
+        return true;
+    }
 };
 
 class bot_recruiter_commandscript : public CommandScript

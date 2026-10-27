@@ -45,11 +45,27 @@ VALUES
 INSERT INTO `creature_template_model`
     (`CreatureID`, `Idx`, `CreatureDisplayID`, `DisplayScale`, `Probability`, `VerifiedBuild`)
 VALUES
-    (900101, 0, 3167, 1.0, 1.0, 12340),
-    (900102, 0, 3524, 1.0, 1.0, 12340),
-    (900103, 0, 2306, 1.0, 1.0, 12340),
-    (900104, 0, 17372, 1.0, 1.0, 12340),
-    (900105, 0, 4259, 1.0, 1.0, 12340),
-    (900106, 0, 10699, 1.0, 1.0, 12340),
-    (900107, 0, 2141, 1.0, 1.0, 12340),
-    (900108, 0, 15511, 1.0, 1.0, 12340);
+    (900101, 0, 3167, 2.0, 1.0, 12340),
+    (900102, 0, 3524, 2.0, 1.0, 12340),
+    (900103, 0, 2306, 2.0, 1.0, 12340),
+    (900104, 0, 17372, 2.0, 1.0, 12340),
+    (900105, 0, 4259, 2.0, 1.0, 12340),
+    (900106, 0, 10699, 2.0, 1.0, 12340),
+    (900107, 0, 2141, 2.0, 1.0, 12340),
+    (900108, 0, 15511, 2.0, 1.0, 12340);
+
+-- Same presence as the Portal Master (entry 190000): double size, and spell
+-- 30540 (Summon Visual), the purple circle under that NPC. Visibility Large
+-- keeps the name readable from across the square. Every recruiter entry shares it.
+DELETE FROM `creature_template_addon` WHERE `entry` BETWEEN 900101 AND 900108;
+INSERT INTO `creature_template_addon`
+    (`entry`, `path_id`, `mount`, `bytes1`, `bytes2`, `emote`, `visibilityDistanceType`, `auras`)
+VALUES
+    (900101, 0, 0, 0, 0, 0, 3, '30540'),
+    (900102, 0, 0, 0, 0, 0, 3, '30540'),
+    (900103, 0, 0, 0, 0, 0, 3, '30540'),
+    (900104, 0, 0, 0, 0, 0, 3, '30540'),
+    (900105, 0, 0, 0, 0, 0, 3, '30540'),
+    (900106, 0, 0, 0, 0, 0, 3, '30540'),
+    (900107, 0, 0, 0, 0, 0, 3, '30540'),
+    (900108, 0, 0, 0, 0, 0, 3, '30540');
